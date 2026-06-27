@@ -3,8 +3,10 @@ package com.videodownloader.repository
 import com.videodownloader.model.VideoInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -19,8 +21,8 @@ class VideoRepository {
         return withContext(Dispatchers.IO) {
             try {
                 when {
-                    isYouTube(url) -> fetchYouTubeInfo(url)
-                    isVimeo(url) -> fetchVimeoInfo(url)
+                    isYouTube(url) -> fetchViaCobalt(url)
+                    isVimeo(url) -> fetchViaCobalt(url)
                     else -> Result.failure(Exception("פלטפורמה לא נתמכת. נסה YouTube או Vimeo."))
                 }
             } catch (e: Exception) {
@@ -50,78 +52,78 @@ class VideoRepository {
         return null
     }
 
-    private fun extractVimeoId(url: String): String? {
-        val pattern = Regex("vimeo\\.com/(\\d+)")
-        return pattern.find(url)?.groupValues?.get(1)
-    }
+    private suspend fun fetchViaCobalt(url: String): Result<VideoInfo> {
+        // שלב 1: קבל שם סרטון ותמונה מ-oEmbed
+        val title: String
+        val thumbnail: String
 
-    private suspend fun fetchYouTubeInfo(url: String): Result<VideoInfo> {
-        val videoId = extractYouTubeId(url)
-            ?: return Result.failure(Exception("לא ניתן לחלץ מזהה הסרטון"))
-
-        // שימוש ב-yt-dlp API ציבורי
-        val apiUrl = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json"
-
-        val request = Request.Builder()
-            .url(apiUrl)
-            .header("User-Agent", "Mozilla/5.0")
-            .build()
-
-        val response = client.newCall(request).execute()
-        if (!response.isSuccessful) {
-            return Result.failure(Exception("לא ניתן לטעון את פרטי הסרטון"))
+        if (isYouTube(url)) {
+            val videoId = extractYouTubeId(url)
+                ?: return Result.failure(Exception("לא ניתן לחלץ מזהה הסרטון"))
+            val oEmbedUrl = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json"
+            val oEmbedRequest = Request.Builder()
+                .url(oEmbedUrl)
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
+                .build()
+            val oEmbedResponse = client.newCall(oEmbedRequest).execute()
+            val oEmbedBody = oEmbedResponse.body?.string() ?: ""
+            val oEmbedJson = JSONObject(oEmbedBody)
+            title = oEmbedJson.optString("title", "סרטון YouTube")
+            thumbnail = "https://img.youtube.com/vi/$videoId/hqdefault.jpg"
+        } else {
+            title = "סרטון"
+            thumbnail = ""
         }
 
-        val body = response.body?.string()
+        // שלב 2: קבל קישור הורדה ישיר מ-cobalt.tools
+        val jsonBody = JSONObject().apply {
+            put("url", url)
+            put("vCodec", "h264")
+            put("vQuality", "720")
+            put("filenamePattern", "basic")
+        }.toString()
+
+        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+
+        val cobaltRequest = Request.Builder()
+            .url("https://api.cobalt.tools/api/json")
+            .post(requestBody)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
+            .build()
+
+        val cobaltResponse = client.newCall(cobaltRequest).execute()
+
+        if (!cobaltResponse.isSuccessful) {
+            return Result.failure(Exception("שגיאה בקבלת קישור הורדה (${cobaltResponse.code})"))
+        }
+
+        val cobaltBody = cobaltResponse.body?.string()
             ?: return Result.failure(Exception("תגובה ריקה מהשרת"))
 
-        val json = JSONObject(body)
-        val title = json.optString("title", "סרטון YouTube")
-        val thumbnail = "https://img.youtube.com/vi/$videoId/hqdefault.jpg"
+        val cobaltJson = JSONObject(cobaltBody)
+        val status = cobaltJson.optString("status")
 
-        // שימוש בשירות הורדה חינמי
-        val downloadUrl = "https://www.y2mate.com/youtube/$videoId"
+        val downloadUrl = when (status) {
+            "stream", "redirect", "success" -> cobaltJson.optString("url", "")
+            "picker" -> {
+                val picker = cobaltJson.optJSONArray("picker")
+                picker?.getJSONObject(0)?.optString("url", "") ?: ""
+            }
+            else -> return Result.failure(Exception("לא ניתן לקבל קישור הורדה: $status"))
+        }
+
+        if (downloadUrl.isEmpty()) {
+            return Result.failure(Exception("קישור הורדה ריק"))
+        }
 
         return Result.success(
             VideoInfo(
                 title = title,
                 thumbnailUrl = thumbnail,
                 downloadUrl = downloadUrl,
-                source = "YouTube"
-            )
-        )
-    }
-
-    private suspend fun fetchVimeoInfo(url: String): Result<VideoInfo> {
-        val videoId = extractVimeoId(url)
-            ?: return Result.failure(Exception("לא ניתן לחלץ מזהה הסרטון"))
-
-        val apiUrl = "https://vimeo.com/api/v2/video/$videoId.json"
-
-        val request = Request.Builder()
-            .url(apiUrl)
-            .header("User-Agent", "Mozilla/5.0")
-            .build()
-
-        val response = client.newCall(request).execute()
-        if (!response.isSuccessful) {
-            return Result.failure(Exception("לא ניתן לטעון את פרטי הסרטון"))
-        }
-
-        val body = response.body?.string()
-            ?: return Result.failure(Exception("תגובה ריקה מהשרת"))
-
-        val json = org.json.JSONArray(body).getJSONObject(0)
-        val title = json.optString("title", "סרטון Vimeo")
-        val thumbnail = json.optString("thumbnail_large", "")
-        val downloadUrl = json.optString("url", url)
-
-        return Result.success(
-            VideoInfo(
-                title = title,
-                thumbnailUrl = thumbnail,
-                downloadUrl = downloadUrl,
-                source = "Vimeo"
+                source = if (isYouTube(url)) "YouTube" else "Vimeo"
             )
         )
     }
