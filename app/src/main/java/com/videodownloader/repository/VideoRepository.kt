@@ -17,12 +17,19 @@ class VideoRepository {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    // רשימת שרתים לנסות בזה אחר זה
+    private val cobaltInstances = listOf(
+        "https://cobalt.api.onrender.com",
+        "https://co.wuk.sh",
+        "https://cobalt.tools/api"
+    )
+
     suspend fun fetchVideoInfo(url: String): Result<VideoInfo> {
         return withContext(Dispatchers.IO) {
             try {
                 when {
-                    isYouTube(url) -> fetchViaCobalt(url)
-                    isVimeo(url) -> fetchViaCobalt(url)
+                    isYouTube(url) -> fetchVideo(url)
+                    isVimeo(url) -> fetchVideo(url)
                     else -> Result.failure(Exception("פלטפורמה לא נתמכת. נסה YouTube או Vimeo."))
                 }
             } catch (e: Exception) {
@@ -31,13 +38,11 @@ class VideoRepository {
         }
     }
 
-    private fun isYouTube(url: String): Boolean {
-        return url.contains("youtube.com") || url.contains("youtu.be")
-    }
+    private fun isYouTube(url: String) =
+        url.contains("youtube.com") || url.contains("youtu.be")
 
-    private fun isVimeo(url: String): Boolean {
-        return url.contains("vimeo.com")
-    }
+    private fun isVimeo(url: String) =
+        url.contains("vimeo.com")
 
     private fun extractYouTubeId(url: String): String? {
         val patterns = listOf(
@@ -52,8 +57,8 @@ class VideoRepository {
         return null
     }
 
-    private suspend fun fetchViaCobalt(url: String): Result<VideoInfo> {
-        // שלב 1: קבל שם סרטון ותמונה מ-oEmbed
+    private suspend fun fetchVideo(url: String): Result<VideoInfo> {
+        // שלב 1: קבל מידע על הסרטון
         val title: String
         val thumbnail: String
 
@@ -61,70 +66,74 @@ class VideoRepository {
             val videoId = extractYouTubeId(url)
                 ?: return Result.failure(Exception("לא ניתן לחלץ מזהה הסרטון"))
             val oEmbedUrl = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json"
-            val oEmbedRequest = Request.Builder()
+            val request = Request.Builder()
                 .url(oEmbedUrl)
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
                 .build()
-            val oEmbedResponse = client.newCall(oEmbedRequest).execute()
-            val oEmbedBody = oEmbedResponse.body?.string() ?: ""
-            val oEmbedJson = JSONObject(oEmbedBody)
-            title = oEmbedJson.optString("title", "סרטון YouTube")
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                val json = JSONObject(response.body?.string() ?: "{}")
+                title = json.optString("title", "סרטון YouTube")
+            } else {
+                title = "סרטון YouTube"
+            }
             thumbnail = "https://img.youtube.com/vi/$videoId/hqdefault.jpg"
         } else {
-            title = "סרטון"
+            title = "סרטון Vimeo"
             thumbnail = ""
         }
 
-        // שלב 2: קבל קישור הורדה ישיר מ-cobalt.tools
+        // שלב 2: נסה כל instance בזה אחר זה
         val jsonBody = JSONObject().apply {
             put("url", url)
             put("vCodec", "h264")
             put("vQuality", "720")
             put("filenamePattern", "basic")
+            put("isAudioOnly", false)
         }.toString()
 
-        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+        for (instance in cobaltInstances) {
+            try {
+                val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url("$instance/api/json")
+                    .post(requestBody)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
+                    .build()
 
-        val cobaltRequest = Request.Builder()
-            .url("https://api.cobalt.tools/api/json")
-            .post(requestBody)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36")
-            .build()
+                val response = client.newCall(request).execute()
+                if (!response.isSuccessful) continue
 
-        val cobaltResponse = client.newCall(cobaltRequest).execute()
+                val body = response.body?.string() ?: continue
+                val json = JSONObject(body)
+                val status = json.optString("status")
 
-        if (!cobaltResponse.isSuccessful) {
-            return Result.failure(Exception("שגיאה בקבלת קישור הורדה (${cobaltResponse.code})"))
-        }
+                val downloadUrl = when (status) {
+                    "stream", "redirect", "success" -> json.optString("url", "")
+                    "picker" -> {
+                        val picker = json.optJSONArray("picker")
+                        picker?.getJSONObject(0)?.optString("url", "") ?: ""
+                    }
+                    else -> continue
+                }
 
-        val cobaltBody = cobaltResponse.body?.string()
-            ?: return Result.failure(Exception("תגובה ריקה מהשרת"))
-
-        val cobaltJson = JSONObject(cobaltBody)
-        val status = cobaltJson.optString("status")
-
-        val downloadUrl = when (status) {
-            "stream", "redirect", "success" -> cobaltJson.optString("url", "")
-            "picker" -> {
-                val picker = cobaltJson.optJSONArray("picker")
-                picker?.getJSONObject(0)?.optString("url", "") ?: ""
+                if (downloadUrl.isNotEmpty()) {
+                    return Result.success(
+                        VideoInfo(
+                            title = title,
+                            thumbnailUrl = thumbnail,
+                            downloadUrl = downloadUrl,
+                            source = if (isYouTube(url)) "YouTube" else "Vimeo"
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                continue
             }
-            else -> return Result.failure(Exception("לא ניתן לקבל קישור הורדה: $status"))
         }
 
-        if (downloadUrl.isEmpty()) {
-            return Result.failure(Exception("קישור הורדה ריק"))
-        }
-
-        return Result.success(
-            VideoInfo(
-                title = title,
-                thumbnailUrl = thumbnail,
-                downloadUrl = downloadUrl,
-                source = if (isYouTube(url)) "YouTube" else "Vimeo"
-            )
-        )
+        return Result.failure(Exception("לא ניתן לקבל קישור הורדה. נסה שוב מאוחר יותר."))
     }
 }
