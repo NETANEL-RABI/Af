@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="colorPrimary">#6C63FF</color>
+    <color name="colorPrimaryVariant">#4B44CC</color>
+    <color name="colorSecondary">#FF6584</color>
+    <color name="colorBackground">#0F0F1A</color>
+    <color name="colorSurface">#1A1A2E</color>
+    <color name="colorOnSurface">#FFFFFF</color>
+    <color name="colorTextSecondary">#AAAACC</color>
+</resources>
