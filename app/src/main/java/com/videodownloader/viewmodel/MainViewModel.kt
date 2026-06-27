@@ -19,8 +19,12 @@ class MainViewModel : ViewModel() {
 
     private val repository = VideoRepository()
 
-    private val _uiState = MutableLiveData<UiState>(UiState.Idle)
+    private val _uiState = MutableLiveData<UiState>()
     val uiState: LiveData<UiState> = _uiState
+
+    init {
+        _uiState.value = UiState.Idle
+    }
 
     fun fetchVideo(url: String) {
         if (url.isBlank()) {
